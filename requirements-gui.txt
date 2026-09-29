@@ -1,0 +1,9 @@
+# Qt / GUI packages. Installed only when the image is built with --build-arg WITH_GUI=1 (default).
+# There is no display in the container: QT_QPA_PLATFORM=offscreen is set, so Qt code
+# imports and runs (tests, rendering widgets/plots to images), but no windows appear.
+PyQt5==5.15.11
+PyQt6==6.10.0
+PySide6==6.10.2
+pyqtgraph==0.14.0
+mplcursors==0.7
+pyfda==0.9.5

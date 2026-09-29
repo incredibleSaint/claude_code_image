@@ -1,0 +1,433 @@
+#!/bin/bash
+# ccb - run Claude Code (or any command) in the claude-box container for the current project.
+#
+#   ccb                                       Claude Code in the current project
+#   ccb -c   /   ccb --resume                 arguments starting with "-" go to claude
+#   ccb bash                                  shell inside the same sandbox
+#   CCB_GPU=all ccb                           + NVIDIA GPU(s) and the host's CUDA toolkit
+#   CCB_RO="/opt/gcc-14.2 $HOME/src/lib" ccb  extra folders, read-only
+#   CCB_RW="$HOME/projects/other" ccb         extra folders, writable
+#   CCB_VENV=~/projects/phy/.venv ccb         use a host Python venv instead of the image's
+#   CCB_RDMA=1 ccb                            + RDMA verbs devices (no packet RX/TX)
+#   CCB_NET=enp1s0f0v0 ccb ./build/phy ...    + an SR-IOV VF for raw packet RX/TX / DPDK
+#   CCB_NET="enp1s0f0v0 enp1s0f1v0" ccb ...   + several interfaces (e.g. one per port)
+#
+# Settings (environment variables):
+#   CCB_ENGINE       docker | podman                        (default: docker)
+#   CCB_IMAGE        image name                             (default: claude-box)
+#   CCB_DATA         Claude Code login, settings, sessions  (default: ~/.local/share/claude-box)
+#   CCB_NETWORK      container network                      (default: "claude-box" if it exists,
+#                    otherwise the engine's default bridge; see README "Blocking the LAN")
+#   CCB_CLI          Claude Code installed by ccb-update     (default: ~/.local/share/claude-box-cli;
+#                    used read-only when present, otherwise the image's own version)
+#   CCB_SECCOMP      seccomp profile (default: ~/.config/claude-box/seccomp.json if present =
+#                    Docker's default + io_uring; "default" = Docker's own, io_uring blocked)
+#   CCB_ENV          names of host variables to pass in, e.g. "CLAUDE_CODE_OAUTH_TOKEN"
+#   CCB_SHM          size of /dev/shm                       (default: 4g)
+#   CCB_GPU          GPUs to pass: all | 0 | 0,1 | GPU-<uuid>  (default: none; "0" is GPU 0)
+#   CCB_GPU_CAPS     NVIDIA driver capabilities             (default: compute,utility)
+#   CCB_CUDA         host CUDA toolkit to mount read-only   (default with CCB_GPU: /usr/local/cuda
+#                    if present; a path to pick a version; 0 = none; works without CCB_GPU too)
+#   CCB_PATH         folders to put first on PATH inside, e.g. "/opt/gcc-15/bin" (mount with CCB_RO)
+#   CCB_VENV         host venv to use instead of the image's /opt/venv (mounted read-only;
+#                    a uv/pyenv interpreter it points to is mounted read-only too)
+#   CCB_RDMA         1 = pass all uverbs* + rdma_cm, unlimited memlock; or a list of interfaces
+#                    or RDMA devices ("enp1s0f1np1", "mlx5_0,mlx5_1") = only those ports
+#   CCB_RAW          1 or a list, like CCB_RDMA, plus CAP_NET_RAW for the command (raw packet QPs, flow
+#                    rules, DPDK) on the NICs as they are; with CCB_NETWORK=host that covers
+#                    all host interfaces. Rootful engine only.
+#   CCB_NET          host netdev(s), space/comma separated: moved into the container for this
+#                    run (needs sudo), command runs as dev with CAP_NET_RAW + CAP_NET_ADMIN
+#   CCB_NET_ALLOW_PF 1 = allow physical ports in CCB_NET (removes them from the host for the run)
+#   CCB_NET_IP       0 = don't copy the interfaces' host IP addresses into the container
+#                    (default: copied in; always restored on the host after the run)
+set -euo pipefail
+
+ENGINE="${CCB_ENGINE:-docker}"
+IMAGE="${CCB_IMAGE:-claude-box}"
+DATA="${CCB_DATA:-$HOME/.local/share/claude-box}"
+NET="${CCB_NET:-}"
+SYSFS="${CCB_SYSFS:-/sys}"      # for testing only
+CFG=/home/dev/.claude           # CLAUDE_CONFIG_DIR in the image
+
+die()  { echo "ccb: $*" >&2; exit 1; }
+warn() { echo "ccb: $*" >&2; }
+
+command -v "$ENGINE" >/dev/null || die "$ENGINE not found (set CCB_ENGINE=docker|podman)"
+mkdir -p -m 700 "$DATA"
+
+# "ccb -c" = "ccb claude -c": arguments starting with "-" are Claude Code options.
+if [ $# -gt 0 ] && [ "${1#-}" != "$1" ]; then set -- claude "$@"; fi
+
+# ---------------------------------------------------------------------------------------
+# Project: the whole git repo, at the same path as on the host (Claude Code keys sessions and
+# folder trust by path; compiler errors, CMake caches and compile_commands.json stay valid).
+# ---------------------------------------------------------------------------------------
+wd="$(pwd -P)"
+home_real="$(realpath -e "$HOME")"
+proj="$(git -C "$wd" rev-parse --show-toplevel 2>/dev/null || true)"
+in_git=1
+# Not in a repo, or in a dotfiles repo at $HOME (never mount the whole home): current folder only.
+if [ -z "$proj" ] || [ "$proj" = "$home_real" ]; then proj="$wd"; in_git=0; fi
+[ "$proj" != "/" ] || die "refusing to mount /; cd into a project first"
+case "$home_real/" in
+  "$proj"/*) die "refusing to mount $proj: it contains your home folder. cd into a project first";;
+esac
+case "$(realpath -m "$DATA")/" in
+  "$proj"/*) die "CCB_DATA is inside the project; the agent would see its own login";;
+esac
+
+extra=()
+declare -A mounted=()
+bind() {  # bind <host path> <container path> <suffix ":ro" or "">
+  [ -n "${mounted[$2]:-}" ] && return 0
+  mounted[$2]=1
+  extra+=(-v "$1:$2$3")
+}
+mounted[$proj]=1
+add_mount() {  # add_mount <path> <suffix>
+  local d="${1/#\~/$HOME}"
+  d="$(realpath -e "$d" 2>/dev/null)" || die "folder not found: $1"
+  bind "$d" "$d" "$2"
+}
+
+# Git worktree or submodule: its object store lives outside the checkout. Mount it too.
+gitc=""
+[ "$in_git" = 1 ] && gitc="$(git -C "$wd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+if [ -n "$gitc" ] && [ -d "$gitc" ]; then
+  gitc="$(realpath -e "$gitc")"
+  case "$gitc/" in "$proj"/*) ;; *) add_mount "$gitc" "";; esac
+fi
+
+for d in ${CCB_RO:-}; do add_mount "$d" ":ro"; done
+for d in ${CCB_RW:-}; do add_mount "$d" ""; done
+
+# ---------------------------------------------------------------------------------------
+# Python: the image's /opt/venv by default; CCB_VENV=<host venv> replaces it for this run.
+# The venv is mounted read-only at its host path (its scripts contain absolute paths).
+# ---------------------------------------------------------------------------------------
+venv_bin=/opt/venv/bin
+env_args=()
+if [ -n "${CCB_VENV:-}" ]; then
+  v="${CCB_VENV/#\~/$HOME}"
+  v="$(realpath -e "$v" 2>/dev/null)" || die "CCB_VENV: folder not found: $CCB_VENV"
+  [ -x "$v/bin/python" ] || die "CCB_VENV: $v/bin/python not found - not a Python environment?"
+  py="$(readlink -f "$v/bin/python")"
+  case "$py" in
+    "$v"/*)
+      ;;  # interpreter inside the env itself (conda style): nothing else to mount
+    /usr/*|/bin/*|/lib/*)
+      # System interpreter: the image must have the same one at the same path.
+      if ! "$ENGINE" run --rm --network none --entrypoint /bin/sh "$IMAGE" -c "test -x '$py'" >/dev/null 2>&1; then
+        img_py="$("$ENGINE" run --rm --network none --entrypoint /bin/sh "$IMAGE" -c 'python3 --version' 2>/dev/null || true)"
+        die "CCB_VENV: $v was created with $py, which the image doesn't have (image: ${img_py:-no python3}). Recreate the venv with the image's Python version, or with uv (uv venv --python X.Y), whose interpreter is mounted automatically"
+      fi
+      ;;
+    *)
+      # Interpreter installed elsewhere (uv, pyenv, ...): mount that installation read-only too.
+      add_mount "$(dirname "$(dirname "$py")")" ":ro"
+      ;;
+  esac
+  if grep -qs '^include-system-site-packages *= *true' "$v/pyvenv.cfg"; then
+    warn "CCB_VENV: venv uses --system-site-packages; the host's system packages are not in the container"
+  fi
+  add_mount "$v" ":ro"
+  venv_bin="$v/bin"
+  env_args+=(-e VIRTUAL_ENV="$v")
+fi
+
+# ---------------------------------------------------------------------------------------
+# GPU: the driver (libcuda, nvidia-smi, device nodes) is injected by the NVIDIA Container
+# Toolkit and always matches the host. The CUDA toolkit (nvcc, cudart, cuFFT, headers, ...)
+# is the host's own, mounted read-only.
+# ---------------------------------------------------------------------------------------
+GPU="${CCB_GPU:-}"
+[ "$GPU" = "none" ] && GPU=""
+gpu=()
+if [ -n "$GPU" ]; then
+  [ -e /dev/nvidiactl ] || die "CCB_GPU set, but the host has no NVIDIA driver loaded (/dev/nvidiactl missing)"
+  if [ "$ENGINE" = "podman" ]; then
+    # CDI: nvidia.com/gpu=all | =0 | =GPU-<uuid>   (spec from: nvidia-ctk cdi generate)
+    IFS=, read -r -a ids <<< "$GPU"
+    for i in "${ids[@]}"; do gpu+=(--device "nvidia.com/gpu=$i"); done
+  else
+    command -v nvidia-container-runtime-hook >/dev/null \
+      || die "CCB_GPU set, but the NVIDIA Container Toolkit is not installed (see README: GPU and CUDA)"
+    if [ "$GPU" = "all" ]; then gpu=(--gpus all); else gpu=(--gpus "\"device=$GPU\""); fi
+  fi
+  env_args+=(-e NVIDIA_DRIVER_CAPABILITIES="${CCB_GPU_CAPS:-compute,utility}")
+fi
+
+CUDA="${CCB_CUDA:-}"
+if [ -z "$CUDA" ] && [ -n "$GPU" ] && [ -d /usr/local/cuda ]; then CUDA=/usr/local/cuda; fi
+cuda_bin=""
+if [ -n "$CUDA" ] && [ "$CUDA" != "0" ]; then
+  c="${CUDA/#\~/$HOME}"
+  c="$(realpath -e "$c" 2>/dev/null)" || die "CCB_CUDA: folder not found: $CUDA"
+  [ -x "$c/bin/nvcc" ] || die "CCB_CUDA: $c/bin/nvcc not found - not a CUDA toolkit?"
+  bind "$c" "$c" ":ro"                         # real path, e.g. /usr/local/cuda-13.3
+  bind "$c" /usr/local/cuda ":ro"              # and the usual alias
+  cuda_bin="$c/bin"
+  lib="$c/lib64"; [ -d "$lib" ] || lib="$c/targets/x86_64-linux/lib"
+  env_args+=(-e CUDA_HOME="$c" -e CUDA_PATH="$c" -e CUDACXX="$c/bin/nvcc" -e LD_LIBRARY_PATH="$lib")
+fi
+
+# Claude Code from the host (installed by ccb-update), read-only; otherwise the image's own.
+CLI="${CCB_CLI:-$HOME/.local/share/claude-box-cli}"
+cli_bin=""
+if [ -x "$CLI/bin/claude" ]; then
+  bind "$(realpath -e "$CLI")" /opt/claude-cli ":ro"
+  cli_bin=/opt/claude-cli/bin
+fi
+
+# CCB_PATH: extra folders to put first on PATH (mount them with CCB_RO), e.g. /opt/gcc-15/bin
+extra_path=""
+for d in ${CCB_PATH:-}; do extra_path+="${d/#\~/$HOME}:"; done
+
+env_args+=(-e PATH="$extra_path$venv_bin${cuda_bin:+:$cuda_bin}${cli_bin:+:$cli_bin}:/home/dev/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+
+# ---------------------------------------------------------------------------------------
+# Environment: terminal, time zone, git identity, and variables named in CCB_ENV.
+# ---------------------------------------------------------------------------------------
+env_args+=(-e TERM="${TERM:-xterm-256color}")
+[ -n "${COLORTERM:-}" ] && env_args+=(-e COLORTERM)
+[ -n "${TZ:-}" ] && env_args+=(-e TZ)
+[ -f /etc/localtime ] && bind "$(realpath -e /etc/localtime)" /etc/localtime ":ro"
+# Commits made inside get your name (only name and email, not your whole ~/.gitconfig).
+for k in name email; do
+  val="$(git -C "$wd" config --get "user.$k" 2>/dev/null || true)"
+  K="${k^^}"
+  [ -n "$val" ] && env_args+=(-e "GIT_AUTHOR_$K=$val" -e "GIT_COMMITTER_$K=$val")
+done
+for n in ${CCB_ENV:-}; do
+  [[ "$n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "CCB_ENV: bad variable name '$n'"
+  if [ -n "${!n+x}" ]; then env_args+=(-e "$n"); else warn "CCB_ENV: $n is not set on the host"; fi
+done
+
+# Seccomp: Docker's default filter blocks io_uring. seccomp.json (from ~/claude-box) is that
+# default plus the three io_uring calls; installed outside the data folder, so the agent can't edit it.
+SECCOMP="${CCB_SECCOMP:-$HOME/.config/claude-box/seccomp.json}"
+sec=()
+if [ "$SECCOMP" != "default" ]; then
+  if [ -f "$SECCOMP" ]; then sec=(--security-opt "seccomp=$SECCOMP")
+  elif [ -n "${CCB_SECCOMP:-}" ]; then die "CCB_SECCOMP: file not found: $SECCOMP"; fi
+fi
+
+network=()
+if [ -n "${CCB_NETWORK:-}" ]; then
+  network=(--network "$CCB_NETWORK")
+elif "$ENGINE" network inspect claude-box >/dev/null 2>&1; then
+  network=(--network claude-box)
+fi
+
+tty=(-i)
+if [ -t 0 ] && [ -t 1 ]; then tty=(-it); fi
+
+common=(--cap-drop=ALL --security-opt no-new-privileges "${sec[@]}" --hostname claude-box
+  --shm-size "${CCB_SHM:-4g}"
+  "${network[@]}"
+  -v "$DATA:$CFG"
+  -v "$proj:$proj" -w "$wd"
+  "${extra[@]}" "${env_args[@]}" "${gpu[@]}")
+
+# ---------------------------------------------------------------------------------------
+# Normal mode (optionally with RDMA verbs devices)
+# ---------------------------------------------------------------------------------------
+if [ -z "$NET" ]; then
+  userns=()
+  if [ "$ENGINE" = "podman" ] && [ "$(id -u)" -ne 0 ]; then userns=(--userns=keep-id); fi
+
+  # Only verbs + rdma_cm nodes. umad/issm (raw MADs, SM access) and MFT (/dev/mst)
+  # are deliberately not passed.
+  # CCB_RDMA / CCB_RAW: "1" = all RDMA devices, or a list of interfaces / RDMA devices
+  # ("enp1s0f1np1", "mlx5_1", "enp1s0f0np0,enp1s0f1np1") = only those ports' uverbs nodes.
+  RAW="${CCB_RAW:-0}"
+  sel="${CCB_RDMA:-0}"
+  [ "$RAW" != "0" ] && sel="$RAW"
+  [ "$RAW" != "0" ] && [ "${CCB_RDMA:-0}" != "0" ] && [ "${CCB_RDMA}" != "1" ] && sel="$CCB_RDMA"
+  rdma=()
+  if [ "$sel" != "0" ]; then
+    shopt -s nullglob
+    if [ "$sel" = "1" ]; then
+      for dev in /dev/infiniband/uverbs*; do [ -c "$dev" ] && rdma+=(--device "$dev"); done
+      [ ${#rdma[@]} -gt 0 ] || die "CCB_RDMA/CCB_RAW set, but no /dev/infiniband/uverbs* on host (driver loaded? try: ibv_devices)"
+    else
+      for n in ${sel//,/ }; do
+        if [ -e "$SYSFS/class/net/$n" ]; then d="$SYSFS/class/net/$n/device"
+        elif [ -e "$SYSFS/class/infiniband/$n" ]; then d="$SYSFS/class/infiniband/$n/device"
+        else die "'$n' is neither a network interface nor an RDMA device on this host"; fi
+        uv=("$d"/infiniband_verbs/uverbs*)
+        [ ${#uv[@]} -eq 1 ] || die "'$n' has no RDMA device (mlx5_ib loaded?)"
+        dev="/dev/infiniband/$(basename "${uv[0]}")"
+        [ -c "$dev" ] || die "$dev not found"
+        rdma+=(--device "$dev")
+      done
+    fi
+    shopt -u nullglob
+    [ -c /dev/infiniband/rdma_cm ] && rdma+=(--device /dev/infiniband/rdma_cm)
+    rdma+=(--ulimit memlock=-1:-1)
+  fi
+
+  # CCB_RAW=1: raw packet QPs, flow rules and DPDK on the NICs as they are, without moving
+  # interfaces. The command runs as dev with CAP_NET_RAW only. Mostly used together with
+  # CCB_NETWORK=host, where the app also sees the netdevs (enp1s0f0np0, ...) and their IPs.
+  if [ "$RAW" != "0" ]; then
+    [ ${#userns[@]} -eq 0 ] || die "CCB_RAW needs a rootful engine: rootless Podman can't grant CAP_NET_RAW for RDMA. Use docker."
+    rdma+=(--user 0 --cap-add NET_RAW --cap-add SETUID --cap-add SETGID)
+    mountpoint -q /dev/hugepages 2>/dev/null && rdma+=(-v /dev/hugepages:/dev/hugepages)
+    [ $# -gt 0 ] || set -- claude
+    set -- setpriv --reuid=dev --regid=dev --clear-groups \
+           --inh-caps=-all,+net_raw --ambient-caps=-all,+net_raw "$@"
+  fi
+
+  exec "$ENGINE" run "${tty[@]}" --rm "${common[@]}" "${userns[@]}" "${rdma[@]}" "$IMAGE" "$@"
+fi
+
+# ---------------------------------------------------------------------------------------
+# Packet mode (CCB_NET): one or more interfaces moved into the container's network namespace
+# ---------------------------------------------------------------------------------------
+# Raw packet QPs, flow rules and DPDK mlx5 need CAP_NET_RAW. Before kernel 6.17 it is
+# checked in the host user namespace, so only a rootful engine works.
+if [ "$ENGINE" = "podman" ] && [ "$(id -u)" -ne 0 ]; then
+  die "CCB_NET needs a rootful engine: rootless Podman can't grant CAP_NET_RAW for RDMA. Use docker."
+fi
+if [ "${CCB_NETWORK:-}" = "host" ]; then
+  die "CCB_NET can't be combined with CCB_NETWORK=host (there is nothing to move the interfaces into). For raw packets with host networking use: CCB_NETWORK=host CCB_RAW=1 ccb"
+fi
+[ -n "${CCB_RDMA:-}" ] && warn "CCB_RDMA is ignored with CCB_NET (only the listed interfaces' own devices are passed)"
+
+if command -v rdma >/dev/null && rdma system show 2>/dev/null | grep -q "netns exclusive"; then
+  die "RDMA netns mode is 'exclusive'; the RDMA device would not follow the interface. Set: sudo rdma system set netns shared"
+fi
+
+read -r -a nets <<< "${NET//,/ }"     # "a b" or "a,b"
+[ ${#nets[@]} -gt 0 ] || die "CCB_NET is empty"
+
+net_args=(--user 0 --cap-add NET_RAW --cap-add NET_ADMIN --cap-add SETUID --cap-add SETGID
+  --ulimit memlock=-1:-1)
+ibdev_list=()
+declare -A host_addrs host_up     # per interface: "inet 10.0.0.5/24" lines, and was it up
+seen=" "
+for n in "${nets[@]}"; do
+  case "$seen" in *" $n "*) die "'$n' is listed twice in CCB_NET";; esac
+  seen+="$n "
+
+  ndev="$SYSFS/class/net/$n"
+  [ -e "$ndev" ] || die "network interface '$n' not found on host (already inside another container?)"
+  [ -d "$ndev/device" ] || die "'$n' is not a PCI device"
+  [ -L "$ndev/master" ] && die "'$n' is part of a bond/bridge ($(basename "$(readlink -f "$ndev/master")")); take it out first"
+
+  if [ ! -e "$ndev/device/physfn" ]; then
+    [ "${CCB_NET_ALLOW_PF:-0}" = "1" ] \
+      || die "'$n' is a physical port, not an SR-IOV VF. Moving it takes it away from the host for this run; set CCB_NET_ALLOW_PF=1 if that's intended"
+    # Never take the host's default route away (that's how you'd lose SSH).
+    if [ -n "$(ip route show default dev "$n" 2>/dev/null)" ] || [ -n "$(ip -6 route show default dev "$n" 2>/dev/null)" ]; then
+      die "'$n' carries the host's default route; refusing to move it"
+    fi
+  fi
+
+  # Moving an interface to another netns drops its IPv4/global IPv6 addresses. Remember them:
+  # they are copied into the container (unless CCB_NET_IP=0) and restored on the host afterwards.
+  host_addrs[$n]="$(ip -o addr show dev "$n" scope global 2>/dev/null | awk '{print $3" "$4}')"
+  host_up[$n]=0
+  ip -o link show dev "$n" 2>/dev/null | grep -q '[<,]UP[,>]' && host_up[$n]=1
+
+  shopt -s nullglob
+  ibdevs=("$ndev"/device/infiniband/*)
+  uverbs=("$ndev"/device/infiniband_verbs/uverbs*)
+  shopt -u nullglob
+  [ ${#ibdevs[@]} -eq 1 ] && [ ${#uverbs[@]} -eq 1 ] \
+    || die "'$n' has no RDMA device (mlx5_ib loaded? check: ls $ndev/device/infiniband)"
+  uv="/dev/infiniband/$(basename "${uverbs[0]}")"
+  [ -c "$uv" ] || die "$uv not found"
+  net_args+=(--device "$uv")
+  ibdev_list+=("$(basename "${ibdevs[0]}")")
+done
+
+[ -c /dev/infiniband/rdma_cm ] && net_args+=(--device /dev/infiniband/rdma_cm)
+if mountpoint -q /dev/hugepages 2>/dev/null; then
+  net_args+=(-v /dev/hugepages:/dev/hugepages)
+else
+  warn "/dev/hugepages is not mounted on the host - DPDK won't have hugepages"
+fi
+
+name="ccb-net-$$"
+sudo_cmd=(); [ "$(id -u)" -ne 0 ] && sudo_cmd=(sudo)
+pid=""
+moved=()
+
+# Put the host's addresses back on an interface that is in the host netns again.
+restore_on_host() {
+  local n="$1" fam addr
+  while read -r fam addr; do
+    [ -n "$addr" ] || continue
+    if [ "$fam" = "inet" ]; then
+      "${sudo_cmd[@]}" ip addr add "$addr" brd + dev "$n" 2>/dev/null
+    else
+      "${sudo_cmd[@]}" ip -6 addr add "$addr" dev "$n" nodad 2>/dev/null
+    fi
+  done <<< "${host_addrs[$n]}"
+  [ "${host_up[$n]}" = "1" ] && "${sudo_cmd[@]}" ip link set "$n" up 2>/dev/null
+  return 0
+}
+
+cleanup() {
+  set +e
+  local n i back=()
+  # Move the interfaces back explicitly (instead of waiting for the netns to die),
+  # so their addresses can be restored right away.
+  for n in "${moved[@]}"; do
+    if [ -n "$pid" ] && "${sudo_cmd[@]}" nsenter --net="/proc/$pid/ns/net" ip link set "$n" netns 1 2>/dev/null; then
+      back+=("$n")
+    fi
+  done
+  "$ENGINE" rm -f "$name" >/dev/null 2>&1
+  for n in "${moved[@]}"; do
+    # Fallback: a physical interface returns by itself when the container's netns is gone.
+    for i in $(seq 1 20); do ip link show dev "$n" >/dev/null 2>&1 && break; sleep 0.5; done
+    if ip link show dev "$n" >/dev/null 2>&1; then
+      restore_on_host "$n"
+    else
+      warn "'$n' did not come back to the host"
+    fi
+  done
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+# Container stays up as root with only the caps above; commands are exec'd into it as dev.
+"$ENGINE" run -d --name "$name" "${common[@]}" "${net_args[@]}" \
+  --entrypoint /usr/bin/tini "$IMAGE" -- sleep infinity >/dev/null
+
+pid="$("$ENGINE" inspect -f '{{.State.Pid}}' "$name")"
+[ -n "$pid" ] && [ "$pid" != "0" ] || die "container didn't start"
+
+echo "ccb: moving ${nets[*]} (${ibdev_list[*]}) into the container (sudo may ask for your password)" >&2
+for n in "${nets[@]}"; do
+  "${sudo_cmd[@]}" ip link set "$n" netns "$pid" || die "could not move $n into the container"
+  moved+=("$n")
+  "$ENGINE" exec "$name" ip link set "$n" up
+  if [ "${CCB_NET_IP:-1}" != "0" ]; then
+    while read -r fam addr; do
+      [ -n "$addr" ] || continue
+      if [ "$fam" = "inet" ]; then
+        "$ENGINE" exec "$name" ip addr add "$addr" brd + dev "$n" || warn "could not add $addr to $n"
+      else
+        "$ENGINE" exec "$name" ip -6 addr add "$addr" dev "$n" nodad || warn "could not add $addr to $n"
+      fi
+      echo "ccb:   $n: $addr" >&2
+    done <<< "${host_addrs[$n]}"
+  fi
+done
+
+[ $# -gt 0 ] || set -- bash
+# Run as dev with only NET_RAW + NET_ADMIN as ambient caps: files stay owned by you.
+# CCB_NET / CCB_IBDEV are space-separated lists in the same order.
+set +e
+"$ENGINE" exec "${tty[@]}" -w "$wd" -e CCB_NET="${nets[*]}" -e CCB_IBDEV="${ibdev_list[*]}" "$name" \
+  setpriv --reuid=dev --regid=dev --clear-groups \
+          --inh-caps=-all,+net_raw,+net_admin --ambient-caps=-all,+net_raw,+net_admin \
+          "$@"
+rc=$?
+set -e
+exit $rc

@@ -1,0 +1,30 @@
+# Optional: containers on the "claude-box" Docker network get the internet, but not your LAN
+# and not the host itself. DNS (port 53) stays allowed so name resolution works.
+# Setup: see README, "Blocking the LAN". Docker with its default iptables firewall backend only.
+[Unit]
+Description=claude-box: block LAN and host access from the claude-box network
+After=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '\
+  set -e; \
+  iptables -N CLAUDE-BOX 2>/dev/null || iptables -F CLAUDE-BOX; \
+  iptables -A CLAUDE-BOX -p udp --dport 53 -j RETURN; \
+  iptables -A CLAUDE-BOX -p tcp --dport 53 -j RETURN; \
+  for n in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do \
+    iptables -A CLAUDE-BOX -d $$n -j REJECT --reject-with icmp-admin-prohibited; \
+  done; \
+  iptables -C DOCKER-USER -i br-claude-box -j CLAUDE-BOX 2>/dev/null \
+    || iptables -I DOCKER-USER -i br-claude-box -j CLAUDE-BOX; \
+  iptables -C INPUT -i br-claude-box -j REJECT --reject-with icmp-admin-prohibited 2>/dev/null \
+    || iptables -I INPUT -i br-claude-box -j REJECT --reject-with icmp-admin-prohibited'
+ExecStop=/bin/sh -c '\
+  iptables -D DOCKER-USER -i br-claude-box -j CLAUDE-BOX 2>/dev/null; \
+  iptables -D INPUT -i br-claude-box -j REJECT --reject-with icmp-admin-prohibited 2>/dev/null; \
+  iptables -F CLAUDE-BOX 2>/dev/null; iptables -X CLAUDE-BOX 2>/dev/null; true'
+
+[Install]
+WantedBy=docker.service

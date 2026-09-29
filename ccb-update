@@ -1,0 +1,82 @@
+#!/bin/bash
+# ccb-update - install or update Claude Code for claude-box on the host, without rebuilding the image.
+#
+#   ccb-update              newest release ("latest")
+#   ccb-update stable       newest release of the stable channel (about a week older)
+#   ccb-update 2.1.281      a specific version (also to go back)
+#
+# Downloads the native Linux binary from Anthropic's release bucket (the same files the official
+# installer uses), checks its SHA-256 against the release manifest, and keeps it on the host:
+#   <CCB_CLI>/share/versions/<version>     the binaries (active + previous one are kept)
+#   <CCB_CLI>/bin/claude                   -> the one ccb uses
+# ccb mounts CCB_CLI read-only; while it exists, the image's own Claude Code is not used.
+#
+# Settings: CCB_CLI (default: ~/.local/share/claude-box-cli)
+#           CCB_RELEASES_URL (default: https://downloads.claude.ai/claude-code-releases)
+set -euo pipefail
+
+CLI="${CCB_CLI:-$HOME/.local/share/claude-box-cli}"
+BASE="${CCB_RELEASES_URL:-https://downloads.claude.ai/claude-code-releases}"
+want="${1:-latest}"
+
+die() { echo "ccb-update: $*" >&2; exit 1; }
+say() { echo "ccb-update: $*" >&2; }
+[[ "$want" =~ ^(latest|stable|[0-9]+\.[0-9]+\.[0-9]+)$ ]] || die "usage: ccb-update [latest|stable|X.Y.Z]"
+command -v curl >/dev/null || die "curl not found"
+command -v python3 >/dev/null || die "python3 not found"
+
+case "$(uname -m)" in
+  x86_64)  platform=linux-x64 ;;
+  aarch64) platform=linux-arm64 ;;
+  *) die "unsupported CPU: $(uname -m)" ;;
+esac
+
+# Short timeouts for the small files; the binary gets a progress bar and may take a while.
+get() { curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 "$@"; }
+
+if [ "$want" = latest ] || [ "$want" = stable ]; then
+  say "asking which version is '$want' ..."
+  ver="$(get "$BASE/$want")" || die "could not read $BASE/$want (network? try a version number)"
+  ver="$(printf '%s' "$ver" | tr -d '[:space:]')"
+  [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "unexpected answer for '$want': ${ver:0:80}"
+else
+  ver="$want"
+fi
+
+mkdir -p "$CLI/share/versions" "$CLI/bin"
+dest="$CLI/share/versions/$ver"
+
+say "Claude Code $ver ($platform): reading the release manifest ..."
+sum="$(get "$BASE/$ver/manifest.json" | python3 -c '
+import json, sys
+m = json.load(sys.stdin)
+print(m["platforms"][sys.argv[1]]["checksum"])' "$platform" 2>/dev/null)" \
+  || die "no manifest for version $ver (does it exist?)"
+[[ "$sum" =~ ^[0-9a-f]{64}$ ]] || die "bad checksum in manifest: $sum"
+
+if [ -x "$dest" ] && [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$sum" ]; then
+  say "$ver is already downloaded"
+else
+  tmp="$dest.part"
+  trap 'rm -f "$tmp"' EXIT
+  say "downloading (about 230 MB) ..."
+  curl -fL --connect-timeout 15 --retry 2 --progress-bar -o "$tmp" "$BASE/$ver/$platform/claude" \
+    || die "download failed"
+  got="$(sha256sum "$tmp" | cut -d' ' -f1)"
+  [ "$got" = "$sum" ] || die "checksum mismatch (expected $sum, got $got); nothing was changed"
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$dest"
+  trap - EXIT
+fi
+
+cfg="$(mktemp -d)"   # so the check leaves nothing in ~/.claude on the host
+CLAUDE_CONFIG_DIR="$cfg" DISABLE_AUTOUPDATER=1 "$dest" --version >/dev/null 2>&1 \
+  || { rm -rf "$cfg"; die "the downloaded binary doesn't run on this host"; }
+rm -rf "$cfg"
+ln -sfn "../share/versions/$ver" "$CLI/bin/claude"
+
+# Keep the active version and the newest other one (to go back quickly).
+( cd "$CLI/share/versions" && ls -1t | { grep -vx -e "$ver" -e '.*\.part' || true; } | tail -n +2 | xargs -r rm -f -- )
+
+say "claude-box now uses Claude Code $ver (kept: $(ls "$CLI/share/versions" | tr '\n' ' '))"
+say "restart running ccb sessions to switch"

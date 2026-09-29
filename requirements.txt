@@ -1,0 +1,58 @@
+# Packages of the image's standard venv (/opt/venv). Edit, then rebuild the image;
+# only the venv step re-runs. Versions pinned to the host environment they came from,
+# so scripts behave the same; dependencies not listed here resolve automatically.
+# numpy 1.26 / scipy 1.15 were held back by aider-chat on the host; bump them when ready.
+
+# --- Numerics / DSP ---
+numpy==1.26.4
+scipy==1.15.3
+pandas==3.0.6               # added (not from the host list); 3.0 works with numpy 1.26
+numba==0.62.1
+numexpr==2.14.1
+sympy==1.14.0
+scikit-commpy==0.8.0
+networkx==3.4.2
+matplotlib==3.10.7          # MPLBACKEND=Agg in the container: plots go to files
+pillow==12.1.1
+
+# --- FPGA / HDL ---
+amaranth==0.5.8
+amaranth-yosys==0.50.0.0.post121   # Yosys as WebAssembly (runs offline via wasmtime)
+pyvcd==0.4.1
+
+# --- Packets, SNMP, binary structures ---
+scapy==2.6.1                # parsing works everywhere, sending needs OC_NET
+pysnmp==6.2.6               # the maintained pysnmp; the old pysnmplib fork conflicts with it
+pysmi==1.6.3
+cstruct==6.1
+crcmod                      # CRC-32/MPEG-2 for DVB PSI tables
+bitstring                   # bit-level parsing (TS headers)
+
+# --- Data formats / text ---
+pyyaml==6.0.3
+jsonschema==4.26.0
+jinja2==3.1.6
+markdown==3.10.2
+docutils==0.22.4
+beautifulsoup4==4.14.3
+regex==2026.1.15
+
+# --- Tooling / testing ---
+pytest
+flake8==7.3.0
+rich==14.3.2
+tqdm==4.67.3
+click==8.3.1
+typer==0.23.0
+psutil==7.2.2
+pexpect==4.9.0
+gitpython==3.1.46
+python-dotenv==1.2.1
+
+# --- HTTP / local services (no internet in the container: local endpoints only) ---
+requests==2.32.5
+httpx==0.28.1
+aiohttp==3.13.3
+fastapi==0.128.8
+pydantic==2.12.5
+openai==2.20.0              # client for the local llama-server: base_url=http://127.0.0.1:8080/v1
