@@ -178,6 +178,8 @@ cli_bin=""
 if [ -x "$CLI/bin/claude" ]; then
   bind "$(realpath -e "$CLI")" /opt/claude-cli ":ro"
   cli_bin=/opt/claude-cli/bin
+elif [ "${1:-claude}" = "claude" ]; then
+  warn "no Claude Code in $CLI yet - run: ccb-update   (trying the image's own copy, if it has one)"
 fi
 
 # CCB_PATH: extra folders to put first on PATH (mount them with CCB_RO), e.g. /opt/gcc-15/bin

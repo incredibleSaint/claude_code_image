@@ -43,7 +43,7 @@ cd ~/claude-box
 docker build -t claude-box --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 ```
 
-The build downloads Claude Code and about 2 GB of Python packages (about 0.8 GB with `--build-arg WITH_GUI=0`, which leaves out Qt). The image contains no CUDA: it comes from the host (see [GPU and CUDA](#gpu-and-cuda)).
+The build downloads about 2 GB of Python packages (about 0.8 GB with `--build-arg WITH_GUI=0`, which leaves out Qt). The image contains no CUDA: it comes from the host (see [GPU and CUDA](#gpu-and-cuda)).
 
 ### 3. Install the `ccb` wrapper (zsh)
 
@@ -65,6 +65,16 @@ mkdir -p ~/.config/claude-box && cp seccomp.json ~/.config/claude-box/
 ```
 
 It lives outside the data folder, so the agent can't change it. Without the file, `ccb` uses Docker's default profile.
+
+### 3b. Install Claude Code (on the host)
+
+The image doesn't contain Claude Code, so the build never needs `claude.ai`. `ccb-update` puts it into `~/.local/share/claude-box-cli`, and `ccb` mounts it read-only:
+
+```zsh
+ccb-update
+```
+
+To bake a fallback copy into the image as well, build with `--network host --build-arg CLAUDE_CODE_VERSION=X.Y.Z`.
 
 ### 4. Log in (once)
 
@@ -578,7 +588,7 @@ ccb-update 2.1.281      # a specific version, also to go back
 
 `ccb-update` downloads the native Linux binary on the host (one file, about 230 MB, with a progress bar) from Anthropic's release bucket, the same files the official installer uses, and checks its SHA-256 against the release manifest. It stores Claude Code in `~/.local/share/claude-box-cli` on the host and keeps the active version plus the previous one. The next `ccb` start mounts that folder read-only and uses it instead of the version built into the image. Running containers keep their version until you restart them. Login, settings and conversations are not affected.
 
-To go back to the image's built-in version: `rm -rf ~/.local/share/claude-box-cli`. The image's version (`CLAUDE_CODE_VERSION` in the Dockerfile) only matters as that fallback, so there's no need to rebuild for updates.
+To go back to the image's built-in version: `rm -rf ~/.local/share/claude-box-cli`. By default the image has no copy of its own (`CLAUDE_CODE_VERSION=none`); build with `--network host --build-arg CLAUDE_CODE_VERSION=X.Y.Z` if you want one as a fallback. Without either, `ccb` tells you to run `ccb-update`.
 
 **Add tools for the agent** (compilers, libraries, clangd, Node.js for MCP servers, …). Add them to the `apt-get install` line in the Dockerfile and rebuild. Python packages go into `requirements.txt`.
 

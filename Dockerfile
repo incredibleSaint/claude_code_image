@@ -74,17 +74,19 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
  && rm -rf /var/lib/apt/lists/*
 USER dev
 
-# Claude Code, native build, pinned. Last step: an update only re-runs this layer.
-# Version: a number (see the changelog), or "stable" / "latest" for the newest one of that channel.
-# Installed to ~/.local/bin/claude -> ~/.local/share/claude/versions/<version>.
+# Claude Code normally comes from the host: ccb-update installs it there and ccb mounts it, so the
+# image doesn't need claude.ai at build time. To also bake a fallback copy into the image, build with
+#   --network host --build-arg CLAUDE_CODE_VERSION=X.Y.Z   (or stable / latest)
 # The build-time ~/.claude is removed: at runtime ccb mounts your data folder there.
 ENV HOME=/home/dev
-ARG CLAUDE_CODE_VERSION=2.1.273
-RUN curl -fsSL -o /tmp/install.sh https://claude.ai/install.sh \
- && bash /tmp/install.sh "${CLAUDE_CODE_VERSION}" \
+ARG CLAUDE_CODE_VERSION=none
+RUN if [ "$CLAUDE_CODE_VERSION" != "none" ]; then \
+      curl -fsSL -o /tmp/install.sh https://claude.ai/install.sh \
+      && bash /tmp/install.sh "${CLAUDE_CODE_VERSION}" \
+      && /home/dev/.local/bin/claude --version; \
+    fi \
  && rm -rf /tmp/install.sh /home/dev/.claude /home/dev/.claude.json \
- && mkdir -m 700 /home/dev/.claude \
- && /home/dev/.local/bin/claude --version
+ && mkdir -m 700 /home/dev/.claude
 
 # Tells Claude about this environment in every session (managed CLAUDE.md, always loaded).
 COPY claude-box.md /etc/claude-code/CLAUDE.md
