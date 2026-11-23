@@ -22,6 +22,8 @@
 #                    used read-only when present, otherwise the image's own version)
 #   CCB_SECCOMP      seccomp profile (default: ~/.config/claude-box/seccomp.json if present =
 #                    Docker's default + io_uring; "default" = Docker's own, io_uring blocked)
+#   CCB_SSH          folder mounted read-only as ~/.ssh (default: ~/.config/claude-box/ssh if it
+#                    exists; 0 = none). Put a key just for the box, config, known_hosts there.
 #   CCB_ENV          names of host variables to pass in, e.g. "CLAUDE_CODE_OAUTH_TOKEN"
 #   CCB_SHM          size of /dev/shm                       (default: 4g)
 #   CCB_GPU          GPUs to pass: all | 0 | 0,1 | GPU-<uuid>  (default: none; "0" is GPU 0)
@@ -170,6 +172,20 @@ if [ -n "$CUDA" ] && [ "$CUDA" != "0" ]; then
   cuda_bin="$c/bin"
   lib="$c/lib64"; [ -d "$lib" ] || lib="$c/targets/x86_64-linux/lib"
   env_args+=(-e CUDA_HOME="$c" -e CUDA_PATH="$c" -e CUDACXX="$c/bin/nvcc" -e LD_LIBRARY_PATH="$lib")
+fi
+
+# SSH: a dedicated folder (key for the lab machines, config, known_hosts) mounted read-only as
+# ~/.ssh. Never your own ~/.ssh: the agent can read whatever is mounted.
+SSHDIR="${CCB_SSH:-$HOME/.config/claude-box/ssh}"
+if [ "$SSHDIR" != "0" ]; then
+  if [ -d "$SSHDIR" ]; then
+    s="$(realpath -e "$SSHDIR")"
+    [ "$s" = "$(realpath -e "$HOME/.ssh" 2>/dev/null || echo none)" ] \
+      && die "CCB_SSH points to your own ~/.ssh; use a separate folder with a key just for the box"
+    bind "$s" /home/dev/.ssh ":ro"
+  elif [ -n "${CCB_SSH:-}" ]; then
+    die "CCB_SSH: folder not found: $SSHDIR"
+  fi
 fi
 
 # Claude Code from the host (installed by ccb-update), read-only; otherwise the image's own.

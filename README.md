@@ -40,8 +40,10 @@ Pass your UID/GID, so that files created in the container belong to you:
 
 ```zsh
 cd ~/claude-box
-docker build -t claude-box --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
+docker build --network host -t claude-box --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
 ```
+
+`--network host` lets the build steps use the host's own network and DNS (your VPN and resolver). On your machine, Docker's bridge network can't resolve names, so without it `apt-get` and `pip` fail. It only affects the build; the image is the same either way. Use this command for every rebuild.
 
 The build downloads about 2 GB of Python packages (about 0.8 GB with `--build-arg WITH_GUI=0`, which leaves out Qt). The image contains no CUDA: it comes from the host (see [GPU and CUDA](#gpu-and-cuda)).
 
@@ -148,7 +150,7 @@ Same paths mean compiler errors, CMake caches and `compile_commands.json` work u
 
 `ccb` refuses to mount your home folder or anything above it. Outside a git repo, only the current folder is mounted. With a dotfiles repo at `~`, it also mounts only the current folder, not `~`.
 
-Inside, commits get your name and email from your git config (`GIT_AUTHOR_*` / `GIT_COMMITTER_*`). Your `~/.gitconfig` itself isn't mounted, and neither are SSH keys, so the agent can commit but can't push. Push from the host.
+Inside, commits get your name and email from your git config (`GIT_AUTHOR_*` / `GIT_COMMITTER_*`). Your `~/.gitconfig` and your own SSH keys aren't mounted, so the agent can commit but can't push (unless you give the box's SSH key access to the git server). Push from the host.
 
 ### Extra folders
 
@@ -178,6 +180,25 @@ Then `gcc`/`g++` inside are GCC 15. This works for a compiler installed into its
 - **Capturing on the RDMA device** (`tcpdump -i mlx5_0`, listed in `tcpdump -D`) shows traffic that bypasses the kernel: raw packet QPs, DPDK, RoCE. A capture on the netdev (`-i enp1s0f1np1`) doesn't see it. The device must be passed (`CCB_RAW` includes it). This is a feature of libpcap and mlx5; I couldn't test it without a card.
 - **No Wireshark GUI:** the box has no display. Save a capture into the project (`-w cap.pcapng`) and open it in Wireshark on the host, or use `termshark` inside.
 
+**SSH to lab machines.** The image has `ssh`, `scp`, `sftp`, `rsync` and `sshpass`. To let the agent log in, give it a separate folder, never your own `~/.ssh` (`ccb` refuses that). The folder is mounted read-only as `~/.ssh`:
+
+```zsh
+mkdir -p ~/.config/claude-box/ssh && cd ~/.config/claude-box/ssh
+ssh-keygen -t ed25519 -N '' -C claude-box -f id_ed25519        # a key only for the box
+ssh-copy-id -i id_ed25519.pub user@astra-pc1                    # once per machine
+ssh-keyscan astra-pc1 >> known_hosts                            # host keys (check them)
+printf 'Host astra1\n  HostName astra-pc1\n  User user\n  IdentityFile ~/.ssh/id_ed25519\n  BatchMode yes\n' >> config
+chmod 700 . && chmod 600 id_ed25519 config
+```
+
+Then `ssh astra1`, `scp` and `rsync -e ssh` work inside, also in non-interactive commands. `BatchMode yes` makes ssh fail at once instead of waiting for a password or a question.
+
+- **Read-only.** The agent can use the key, but can't change the config or add hosts. A host missing from `known_hosts` fails with `Host key verification failed`; add it on the host.
+- **Passwords:** start with `SSHPASS=... CCB_ENV=SSHPASS ccb`, and the agent uses `sshpass -e ssh ...`. The password is then in the container's environment, so the agent can read it. A key is better.
+- **What it means:** the agent can do on those machines whatever that user can. Use a dedicated user there where possible; remove the key from `authorized_keys` to revoke access.
+- **Network:** the machines must be reachable. With the [LAN block](#blocking-the-lan-optional) active they aren't; with `CCB_NETWORK=host` they are.
+- `CCB_SSH=<folder>` uses another folder, `CCB_SSH=0` mounts none.
+
 **podman** is installed, but it can't start or build containers inside the box: that needs privileges the container doesn't have (`cannot clone: Operation not permitted`). Run container steps on the host. The only way to give the agent real container access is the host's podman or Docker socket, which is equivalent to root on the host.
 
 ### Python
@@ -199,6 +220,7 @@ Differences:
 | `CCB_IMAGE` | `claude-box` |
 | `CCB_DATA` | `~/.local/share/claude-box` (login, settings, conversations) |
 | `CCB_NETWORK` | the `claude-box` network if it exists (see [Blocking the LAN](#blocking-the-lan-optional)), otherwise the engine's default bridge |
+| `CCB_SSH` | `~/.config/claude-box/ssh` if it exists: mounted read-only as `~/.ssh` (see SSH under [Compilers and tools](#compilers-and-tools)); `0` = none |
 | `CCB_ENV` | names of host variables to pass in, e.g. `CLAUDE_CODE_OAUTH_TOKEN` |
 | `CCB_SHM` | `4g`: size of `/dev/shm` (Docker's default of 64 MB is too small for CUDA IPC, DPDK or multiprocessing) |
 | `CCB_GPU` | off. `all`, `0`, `0,1` or `GPU-<uuid>` (see [GPU and CUDA](#gpu-and-cuda)). Note: `0` means GPU 0; to turn it off, unset it or set `none` |

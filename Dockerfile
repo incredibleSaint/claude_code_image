@@ -72,6 +72,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
       iperf3 netcat-openbsd socat iputils-ping iputils-arping traceroute mtr-tiny \
       dnsutils nmap lsof strace \
  && rm -rf /var/lib/apt/lists/*
+
+# SSH to lab machines: ssh/scp/sftp, rsync, sshpass (password logins). Keys and config come from
+# the host folder ccb mounts read-only at ~/.ssh (CCB_SSH, see README); the image has none.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      openssh-client sshpass rsync \
+ && rm -rf /var/lib/apt/lists/*
 USER dev
 
 # Claude Code normally comes from the host: ccb-update installs it there and ccb mounts it, so the
