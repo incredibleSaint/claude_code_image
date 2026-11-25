@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# kcb - run Kimi Code inside the existing claude-box sandbox.
+#
+#   kcb                    Start Kimi Code
+#   kcb -c                 Continue the most recent session
+#   kcb -p "prompt"        Run one non-interactive prompt
+#   kcb shell              Open a shell with the same Kimi data mounted
+#
+# Optional settings:
+#   KCB_DATA               Kimi data on the host (default: ~/.local/share/kimi-box)
+#   KCB_CLI                Kimi Code installed by kcb-update (default: ~/.local/share/kimi-box-cli;
+#                          used read-only when present, otherwise the image's own version)
+#   CCB_BIN                ccb executable or path (default: ccb)
+#
+# All normal CCB_* settings still work, including CCB_ENGINE=podman,
+# CCB_GPU, CCB_RO, CCB_RW, CCB_NETWORK and CCB_RDMA.
+
+set -euo pipefail
+
+# ccb mounts CCB_DATA at /home/dev/.claude. Through kcb, that directory
+# contains only Kimi's data, not Claude's data.
+export CCB_DATA="${KCB_DATA:-$HOME/.local/share/kimi-box}"
+export KIMI_CODE_HOME=/home/dev/.claude
+export CCB_ENV="KIMI_CODE_HOME${CCB_ENV:+ $CCB_ENV}"
+
+# DeepSeek: config.toml in KCB_DATA reads the key via api_key_env; pass it in when set.
+if [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+    export CCB_ENV="DEEPSEEK_API_KEY $CCB_ENV"
+fi
+
+# Kimi Code from the host (installed by kcb-update), read-only; otherwise the image's own.
+kcb_cli="${KCB_CLI:-$HOME/.local/share/kimi-box-cli}"
+if [ -x "$kcb_cli/bin/kimi" ]; then
+    export CCB_RO="$kcb_cli${CCB_RO:+ $CCB_RO}"
+    export CCB_PATH="$kcb_cli/bin${CCB_PATH:+ $CCB_PATH}"
+fi
+
+ccb_bin="${CCB_BIN:-ccb}"
+
+if [ "${1:-}" = "shell" ]; then
+    shift
+    exec "$ccb_bin" bash "$@"
+fi
+
+exec "$ccb_bin" kimi "$@"

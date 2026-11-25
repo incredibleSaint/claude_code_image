@@ -1,0 +1,101 @@
+#!/bin/bash
+# dcb-update - install or update DeepSeek Harness for dcb on the host, without rebuilding the image.
+#
+#   dcb-update                 newest release (npm dist-tag "latest")
+#   dcb-update 0.2.2-rc.5      a specific version (also to go back)
+#
+# dsh is an npm package and needs Node ^24.22.3 || >=26.13.1, which the host may not have,
+# so this keeps both on the host:
+#   <DCB_CLI>/node/                      Node.js runtime (official tarball, SHA-256 checked)
+#   <DCB_CLI>/share/versions/<version>/  the npm package (active + previous one are kept)
+#   <DCB_CLI>/bin/dsh                    -> the one dcb uses
+# dcb mounts DCB_CLI read-only; while it exists, the image's own Node and dsh are not used.
+#
+# Settings: DCB_CLI (default: ~/.local/share/dsh-box-cli)
+#           DCB_NODE_VERSION (default: 24.22.3; only used when Node is (re)installed)
+set -euo pipefail
+
+CLI="${DCB_CLI:-$HOME/.local/share/dsh-box-cli}"
+want="${1:-latest}"
+node_ver="${DCB_NODE_VERSION:-24.22.3}"
+
+die() { echo "dcb-update: $*" >&2; exit 1; }
+say() { echo "dcb-update: $*" >&2; }
+[[ "$want" =~ ^[0-9A-Za-z.+-]+$ ]] || die "usage: dcb-update [latest|X.Y.Z[-tag]]"
+command -v curl >/dev/null || die "curl not found"
+
+case "$(uname -m)" in
+  x86_64)  arch=x64 ;;
+  aarch64) arch=arm64 ;;
+  *) die "unsupported CPU: $(uname -m)" ;;
+esac
+
+# ---------------------------------------------------------------------------------------------
+# Node.js runtime
+# ---------------------------------------------------------------------------------------------
+if [ -x "$CLI/node/bin/node" ] && [ "$("$CLI/node/bin/node" --version)" = "v$node_ver" ]; then
+  say "Node v$node_ver is already installed"
+else
+  say "installing Node v$node_ver ($arch) ..."
+  base="https://nodejs.org/dist/v$node_ver"
+  pkg="node-v$node_ver-linux-$arch.tar.xz"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  curl -fsSL --connect-timeout 15 --retry 2 -o "$tmp/$pkg" "$base/$pkg" || die "download failed (does v$node_ver exist?)"
+  sum="$(curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 "$base/SHASUMS256.txt" | grep " $pkg\$" | cut -d' ' -f1)"
+  [[ "$sum" =~ ^[0-9a-f]{64}$ ]] || die "no checksum for $pkg in SHASUMS256.txt"
+  got="$(sha256sum "$tmp/$pkg" | cut -d' ' -f1)"
+  [ "$got" = "$sum" ] || die "checksum mismatch (expected $sum, got $got); nothing was changed"
+  tar -xJf "$tmp/$pkg" -C "$tmp"
+  rm -rf "$CLI/node"
+  mkdir -p "$CLI"
+  mv "$tmp/node-v$node_ver-linux-$arch" "$CLI/node"
+  rm -rf "$tmp"
+  trap - EXIT
+fi
+export PATH="$CLI/node/bin:$PATH"
+
+# ---------------------------------------------------------------------------------------------
+# dsh (npm package)
+# ---------------------------------------------------------------------------------------------
+say "asking which version is '$want' ..."
+ver="$(npm view "@deepseek-ai/dsh@$want" version 2>/dev/null | tail -n 1 | tr -d '[:space:]')"
+[[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || die "could not resolve '@deepseek-ai/dsh@$want' (network? typo?)"
+
+mkdir -p "$CLI/share/versions" "$CLI/bin"
+dest="$CLI/share/versions/$ver"
+
+if [ -e "$dest/bin/dsh" ]; then
+  say "$ver is already downloaded"
+else
+  say "installing @deepseek-ai/dsh@$ver ..."
+  rm -rf "$dest.part"
+  # npm 11+ blocks dependency install scripts unless allowed. dsh needs these five:
+  # the subprocess spawn helper and node-pty run the agent's shell commands, koffi is
+  # FFI for sandboxing, and the other two are harmless setup no-ops dsh ships with.
+  allow="@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs"
+  out="$(npm_config_allow_scripts="$allow" \
+    npm install -g --prefix "$dest.part" "@deepseek-ai/dsh@$ver" 2>&1)" \
+    || { rm -rf "$dest.part"; printf '%s\n' "$out" >&2; die "npm install failed"; }
+  # Warn about scripted packages a future dsh adds beyond the list above.
+  blocked="$(printf '%s\n' "$out" | sed -n 's/^npm warn install-scripts  *\([^ ]*\) (.*/\1/p' \
+             | grep -v '^npm$' || true)"
+  [ -z "$blocked" ] || say "warning: install scripts blocked for: $(printf '%s' "$blocked" | tr '\n' ' ')- dsh may not work fully; add these to 'allow' in dcb-update"
+  mv -f "$dest.part" "$dest"
+fi
+
+# corepack provides pnpm for `dsh plugin`; its shims go next to dsh.
+"$CLI/node/bin/corepack" enable --install-directory "$CLI/bin" >/dev/null 2>&1 \
+  || say "warning: corepack enable failed; 'dsh plugin' may not find pnpm"
+ln -sfn "../share/versions/$ver/bin/dsh" "$CLI/bin/dsh"
+
+cfg="$(mktemp -d)"   # so the check leaves nothing in the real DSH_HOME
+got="$(PATH="$CLI/bin:$PATH" DSH_HOME="$cfg" "$CLI/bin/dsh" --version 2>/dev/null)" \
+  || { rm -rf "$cfg"; die "the installed dsh doesn't run on this host"; }
+rm -rf "$cfg"
+
+# Keep the active version and the newest other one (to go back quickly).
+( cd "$CLI/share/versions" && ls -1t | { grep -vx -e "$ver" -e '.*\.part' || true; } | tail -n +2 | xargs -r rm -rf -- )
+
+say "dcb now uses DeepSeek Harness $got (kept: $(ls "$CLI/share/versions" | tr '\n' ' '))"
+say "restart running dcb sessions to switch"

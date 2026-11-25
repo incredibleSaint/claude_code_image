@@ -121,6 +121,21 @@ RUN curl -fsSL -o /tmp/kimi-install.sh \
  && /home/dev/.local/bin/kimi --version \
  && rm -f /tmp/kimi-install.sh
 
+# Node.js for DeepSeek Harness (dsh requires ^24.22.3 || >=26.13.1; Ubuntu 24.04's node is too old).
+USER root
+ARG NODE_VERSION=24.22.3
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+      | tar -xJ -C /usr/local --strip-components=1 \
+ && node --version
+
+# DeepSeek Harness (dsh). Data lives in DSH_HOME, supplied by the dcb wrapper at runtime.
+# Pin a release with DSH_VERSION=X.Y.Z; corepack provides pnpm for `dsh plugin`.
+ARG DSH_VERSION=latest
+RUN npm install -g "@deepseek-ai/dsh@${DSH_VERSION}" \
+ && corepack enable \
+ && dsh --version
+USER dev
+
 # Tells Claude about this environment in every session (managed CLAUDE.md, always loaded).
 COPY claude-box.md /etc/claude-code/CLAUDE.md
 

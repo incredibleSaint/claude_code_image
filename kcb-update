@@ -1,0 +1,46 @@
+#!/bin/bash
+# kcb-update - install or update Kimi Code for kcb on the host, without rebuilding the image.
+#
+#   kcb-update              newest release ("latest")
+#   kcb-update 1.2.3        a specific version (also to go back)
+#
+# Runs Kimi's official installer (which verifies the download's SHA-256 itself) with
+# KIMI_INSTALL_DIR pointing at the host folder:
+#   <KCB_CLI>/bin/kimi      the executable kcb uses
+# kcb mounts KCB_CLI read-only; while it exists, the image's own Kimi Code is not used.
+#
+# Settings: KCB_CLI (default: ~/.local/share/kimi-box-cli)
+set -euo pipefail
+
+CLI="${KCB_CLI:-$HOME/.local/share/kimi-box-cli}"
+want="${1:-latest}"
+
+die() { echo "kcb-update: $*" >&2; exit 1; }
+say() { echo "kcb-update: $*" >&2; }
+[[ "$want" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+)$ ]] || die "usage: kcb-update [latest|X.Y.Z]"
+command -v curl >/dev/null || die "curl not found"
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+say "downloading the installer ..."
+curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 \
+  -o "$tmp/install.sh" https://code.kimi.ai/kimi-code/install.sh \
+  || die "could not download the installer (network?)"
+
+if [ "$want" = latest ]; then
+  KIMI_INSTALL_DIR="$CLI" KIMI_NO_MODIFY_PATH=1 bash "$tmp/install.sh" || die "installer failed"
+else
+  KIMI_VERSION="$want" KIMI_INSTALL_DIR="$CLI" KIMI_NO_MODIFY_PATH=1 bash "$tmp/install.sh" \
+    || die "installer failed (does version $want exist?)"
+fi
+
+[ -x "$CLI/bin/kimi" ] || die "installer finished but $CLI/bin/kimi is missing"
+
+cfg="$(mktemp -d)"   # so the check leaves nothing in the real KIMI_CODE_HOME
+ver="$(KIMI_CODE_HOME="$cfg" KIMI_CODE_NO_AUTO_UPDATE=1 "$CLI/bin/kimi" --version 2>/dev/null)" \
+  || { rm -rf "$cfg"; die "the installed binary doesn't run on this host"; }
+rm -rf "$cfg"
+
+say "kcb now uses Kimi Code $ver (from $CLI)"
+say "restart running kcb sessions to switch"

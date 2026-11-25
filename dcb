@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# dcb - run DeepSeek Harness (dsh) inside the existing claude-box sandbox.
+#
+#   dcb                    Web UI on http://127.0.0.1:3080 (opens no browser)
+#   dcb headless "task"    Answer one task in the terminal and exit
+#   dcb shell              Open a shell with the same dsh data mounted
+#   dcb <args>             Anything else is passed to dsh verbatim
+#
+# Optional settings:
+#   DCB_DATA               dsh data on the host (default: ~/.local/share/dsh-box)
+#   DCB_CLI                dsh + Node installed by dcb-update (default: ~/.local/share/dsh-box-cli;
+#                          used read-only when present, otherwise the image's own versions)
+#   CCB_BIN                ccb executable or path (default: ccb)
+#
+# All normal CCB_* settings still work, including CCB_ENGINE=podman,
+# CCB_GPU, CCB_RO, CCB_RW and CCB_RDMA.
+
+set -euo pipefail
+
+# ccb mounts CCB_DATA at /home/dev/.claude. Through dcb, that directory
+# contains only dsh's data ($DSH_HOME), not Claude's or Kimi's.
+export CCB_DATA="${DCB_DATA:-$HOME/.local/share/dsh-box}"
+export DSH_HOME=/home/dev/.claude
+export CCB_ENV="DSH_HOME${CCB_ENV:+ $CCB_ENV}"
+
+# dsh's built-in DeepSeek route reads DEEPSEEK_API_KEY per request; pass it in when set.
+if [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+    export CCB_ENV="DEEPSEEK_API_KEY $CCB_ENV"
+fi
+
+# dsh + Node from the host (installed by dcb-update), read-only; otherwise the image's own.
+# dsh's bin has an env-node shebang, so node's bin dir goes on PATH too.
+dcb_cli="${DCB_CLI:-$HOME/.local/share/dsh-box-cli}"
+if [ -x "$dcb_cli/bin/dsh" ]; then
+    export CCB_RO="$dcb_cli${CCB_RO:+ $CCB_RO}"
+    export CCB_PATH="$dcb_cli/bin $dcb_cli/node/bin${CCB_PATH:+ $CCB_PATH}"
+fi
+
+ccb_bin="${CCB_BIN:-ccb}"
+
+case "${1:-web}" in
+    shell)
+        shift
+        exec "$ccb_bin" bash "$@"
+        ;;
+    web)
+        [ $# -gt 0 ] && shift
+        # The browser runs on the host, so the Web UI must listen on the host's
+        # loopback: share the host network namespace for this run (override with
+        # CCB_NETWORK if you publish the port some other way).
+        export CCB_NETWORK="${CCB_NETWORK:-host}"
+        exec "$ccb_bin" dsh web --no-open "$@"
+        ;;
+    *)
+        exec "$ccb_bin" dsh "$@"
+        ;;
+esac
