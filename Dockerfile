@@ -1,5 +1,13 @@
 FROM ubuntu:24.04
 
+# The host's local proxy may return 502 for Ubuntu's HTTP archive while direct
+# access works. Bypass it only for Ubuntu APT hosts; every other build download
+# (including Kimi and optional Claude Code installation) still uses the proxy.
+RUN printf '%s\n' \
+      'Acquire::http::Proxy::archive.ubuntu.com "DIRECT";' \
+      'Acquire::http::Proxy::security.ubuntu.com "DIRECT";' \
+      > /etc/apt/apt.conf.d/99ubuntu-direct
+
 # Tools the agent needs. Add your own toolchain / libraries here.
 # ncurses-term, kitty-terminfo: terminfo for alacritty/wezterm/foot/kitty, since ccb passes your TERM in.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -94,13 +102,34 @@ RUN if [ "$CLAUDE_CODE_VERSION" != "none" ]; then \
  && rm -rf /tmp/install.sh /home/dev/.claude /home/dev/.claude.json \
  && mkdir -m 700 /home/dev/.claude
 
+# Kimi Code CLI. Install the executable under ~/.local, separately from its runtime data.
+# The kcb wrapper supplies KIMI_CODE_HOME at runtime. The global installer verifies the
+# downloaded binary's SHA-256 checksum. Pin a release with KIMI_CODE_VERSION=X.Y.Z.
+ARG KIMI_CODE_VERSION=latest
+RUN curl -fsSL -o /tmp/kimi-install.sh \
+      https://code.kimi.ai/kimi-code/install.sh \
+ && if [ "$KIMI_CODE_VERSION" = "latest" ]; then \
+      KIMI_INSTALL_DIR=/home/dev/.local \
+      KIMI_NO_MODIFY_PATH=1 \
+      bash /tmp/kimi-install.sh; \
+    else \
+      KIMI_VERSION="$KIMI_CODE_VERSION" \
+      KIMI_INSTALL_DIR=/home/dev/.local \
+      KIMI_NO_MODIFY_PATH=1 \
+      bash /tmp/kimi-install.sh; \
+    fi \
+ && /home/dev/.local/bin/kimi --version \
+ && rm -f /tmp/kimi-install.sh
+
 # Tells Claude about this environment in every session (managed CLAUDE.md, always loaded).
 COPY claude-box.md /etc/claude-code/CLAUDE.md
 
 # Set after the install (DISABLE_UPDATES would block it). Update Claude Code by rebuilding.
 # CLAUDE_CONFIG_DIR puts .claude.json (login, per-project trust) inside the mounted folder too.
+# Kimi automatic updates are disabled because its executable belongs to the immutable image.
 # No display: matplotlib writes files, Qt renders offscreen.
 ENV CLAUDE_CONFIG_DIR=/home/dev/.claude \
+    KIMI_CODE_NO_AUTO_UPDATE=1 \
     DISABLE_AUTOUPDATER=1 \
     DISABLE_UPDATES=1 \
     LANG=C.UTF-8 \
